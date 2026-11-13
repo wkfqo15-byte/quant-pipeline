@@ -1,0 +1,30 @@
+name: Daily Quant Data Update
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # 매일 UTC 자정 (한국 시간 오전 9시) 자동 실행
+  workflow_dispatch: # 깃허브 웹사이트에서 수동으로 버튼을 눌러 실행할 수 있는 옵션
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 깃허브 저장소 코드 불러오기
+        uses: actions/checkout@v3
+
+      - name: 파이썬(3.11) 환경 세팅
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 필요 패키지 설치
+        run: |
+          pip install yfinance pyupbit pandas pyarrow boto3 python-dotenv
+
+      - name: 최신 데이터 수집 및 AWS S3 업로드 실행
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          python quant_pipeline/fetch_prices.py

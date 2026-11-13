@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>보안 파일 공유 서비스</title>
+    <!-- 🌟 세계에서 가장 유명한 자바스크립트 암호화 도구(CryptoJS) 불러오기 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <style>
+        body { font-family: 'Arial', sans-serif; text-align: center; margin-top: 50px; }
+        .box { border: 1px solid #ccc; padding: 30px; width: 300px; margin: 0 auto; border-radius: 10px; }
+        input, button { padding: 10px; margin: 10px 0; width: 90%; }
+        button { background-color: #007BFF; color: white; border: none; cursor: pointer; border-radius: 5px; }
+        button:hover { background-color: #0056b3; }
+        #resultMessage { margin-top: 15px; font-weight: bold; font-size: 1.1em; }
+        #uploadSection { display: none; margin-top: 20px; padding-top: 20px; border-top: 2px dashed #007BFF; }
+        .file-link { display: block; margin: 10px 0; padding: 10px; background-color: #f8f9fa; border-radius: 5px; border: 1px solid #ddd; cursor: pointer;}
+        .file-link:hover { background-color: #e2e6ea; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h2>📁 절대 보안 파일 공유</h2>
+        <button onclick="createRoom()">새로운 방 만들기</button>
+        <hr style="margin: 20px 0;">
+        <input type="text" id="roomCode" placeholder="6자리 방 코드 입력" maxlength="6">
+        <button onclick="joinRoom()">입장하기</button>
+        <div id="resultMessage"></div>
+
+        <div id="uploadSection">
+            <div id="fileList"></div>
+            <h3 style="margin-top: 30px;">파일 올리기</h3>
+            <input type="file" id="fileInput">
+            <button onclick="uploadFile()" style="background-color: #28a745;">서버로 전송</button>
+        </div>
+    </div>
+
+    <script>
+        let currentRoomCode = ""; 
+
+        async function createRoom() {
+            const response = await fetch('/create-room');
+            const data = await response.json();
+            if(data.status === 'success') {
+                document.getElementById('resultMessage').innerHTML = `<span style="color: blue;">방 생성 완료! 코드: ${data.room_code}</span>`;
+            }
+        }
+
+        async function joinRoom() {
+            const code = document.getElementById('roomCode').value;
+            if(!code) return alert("방 코드를 입력해주세요!");
+
+            const response = await fetch(`/join-room/${code}`);
+            const data = await response.json();
+
+            if(data.status === 'success') {
+                document.getElementById('resultMessage').innerHTML = `<span style="color: green;">${data.message}</span>`;
+                currentRoomCode = code;
+                document.getElementById('uploadSection').style.display = 'block';
+                
+                const fileListDiv = document.getElementById('fileList');
+                fileListDiv.innerHTML = "<h3>업로드된 파일</h3>";
+                
+                if(data.files && data.files.length > 0) {
+                    data.files.forEach(fileName => {
+                        fileListDiv.innerHTML += `<button onclick="downloadAndDecrypt('${fileName}')" class="file-link">🔒 ${fileName} 복호화 및 다운로드</button>`;
+                    });
+                } else {
+                    fileListDiv.innerHTML += "<p style='color:gray; font-size: 0.9em;'>아직 올라온 파일이 없습니다.</p>";
+                }
+            } else {
+                document.getElementById('resultMessage').innerHTML = `<span style="color: red;">${data.message}</span>`;
+                document.getElementById('uploadSection').style.display = 'none';
+            }
+        }
+
+        async function uploadFile() {
+            const fileInput = document.getElementById('fileInput');
+            const file = fileInput.files[0];
+            if(!file) return alert("파일을 먼저 선택해주세요!");
+
+            const reader = new FileReader();
+            reader.onload = async function(e) {
+                const fileData = e.target.result; 
+                
+                const encryptedData = CryptoJS.AES.encrypt(fileData, currentRoomCode).toString();
+                
+                const encryptedBlob = new Blob([encryptedData], { type: 'text/plain' });
+                const formData = new FormData();
+                formData.append("file", encryptedBlob, file.name + ".enc");
+
+                const response = await fetch(`/upload/${currentRoomCode}`, {
+                    method: "POST",
+                    body: formData
+                });
+                const data = await response.json();
+                if(data.status === 'success') {
+                    alert("파일이 안전하게 암호화되어 전송되었습니다!");
+                    joinRoom(); 
+                }
+            };
+            reader.readAsDataURL(file);
+        }
+
+        // 🌟 강화된 다운로드 및 복호화 함수
+        async function downloadAndDecrypt(fileName) {
+            alert("서버에서 암호화된 파일을 가져와 복원을 시작합니다...");
+            
+            try {
+                const safeFileName = encodeURIComponent(fileName);
+                
+                const response = await fetch(`/download/${safeFileName}`, {
+                    headers: { "ngrok-skip-browser-warning": "69420" }
+                });
+                
+                const encryptedText = await response.text(); 
+                
+                if (encryptedText.includes('"status":"error"') || encryptedText.startsWith('<')) {
+                    alert("서버에서 파일을 받아오지 못했습니다! (ngrok 경고창 개입 또는 파일 없음)");
+                    return;
+                }
+
+                const decryptedBytes = CryptoJS.AES.decrypt(encryptedText, currentRoomCode);
+                const originalDataUrl = decryptedBytes.toString(CryptoJS.enc.Utf8);
+                
+                if(!originalDataUrl) throw new Error("데이터가 훼손되었거나 방 코드가 다릅니다.");
+
+                const a = document.createElement("a");
+                a.href = originalDataUrl;
+                a.download = fileName.replace('.enc', ''); 
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                
+            } catch(e) {
+                alert("복호화 실패! 원인: " + e.message + "\n(용량이 큰 파일은 모바일 브라우저가 해독하지 못할 수 있습니다.)");
+            }
+        }
+    </script>
+</body>
+</html>
