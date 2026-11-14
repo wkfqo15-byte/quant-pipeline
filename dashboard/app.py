@@ -1,97 +1,106 @@
 import streamlit as st
 import pandas as pd
-from pyathena import connect
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import boto3
 import os
+import io
+import yfinance as yf
 from dotenv import load_dotenv
 
+# 1. 로컬 .env 파일에서 AWS 암호 불러오기
 load_dotenv()
 
+# 2. 웹 페이지 기본 설정
 st.set_page_config(page_title="Quant Dashboard", layout="wide")
-st.title("📈 퀀트 포트폴리오 데이터 조회")
+st.title("📈 상록의 Quant 파이프라인 대시보드 (실제 일별 환율 반영 USD)")
 
-st.sidebar.header("AWS 접속 정보")
-aws_access_key = st.sidebar.text_input("Access Key", type="password")
-aws_secret_key = st.sidebar.text_input("Secret Key", type="password")
-s3_staging = "s3://quant-portfolio-datalake-sr/athena-results/" 
+# 3. AWS S3 연결
+s3 = boto3.client(
+    's3',
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+)
+bucket_name = 'quant-portfolio-datalake-sr'
+prefix = 'raw_data/'
 
-if st.button("데이터 조회하기"):
-    if aws_access_key and aws_secret_key:
-        with st.spinner("Athena에서 데이터를 가져오는 중..."):
-            try:
-                conn = connect(
-                    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-                    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-                    region_name="ap-southeast-2", 
-                    s3_staging_dir="s3://quant-portfolio-datalake-sr/athena-results/"
+# 4. S3 데이터 불러오기 + 일자별 실제 환율(KRW=X) 매칭 변환
+@st.cache_data(ttl=3600)
+def load_all_data():
+    response = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+    if 'Contents' not in response:
+        return None
+    
+    files = sorted(response['Contents'], key=lambda x: x['LastModified'])
+    
+    df_list = []
+    for file in files:
+        key = file['Key']
+        if key.endswith('.parquet'):
+            obj = s3.get_object(Bucket=bucket_name, Key=key)
+            df_temp = pd.read_parquet(io.BytesIO(obj['Body'].read()))
+            df_temp.columns = [col.lower() if col.lower() == 'timestamp' else col.upper() for col in df_temp.columns]
+            df_list.append(df_temp)
+            
+    if not df_list:
+        return None
+        
+    st.caption(f"총 {len(df_list)}개의 누적 데이터 파일을 불러왔습니다. (최신 파일: {files[-1]['Key']})")
+    
+    full_df = pd.concat(df_list, ignore_index=True)
+    
+    if 'timestamp' in full_df.columns:
+        full_df['timestamp'] = pd.to_datetime(full_df['timestamp'])
+        full_df = full_df.sort_values('timestamp').drop_duplicates(subset=['timestamp'], keep='last').reset_index(drop=True)
+        
+        # 💱 핵심: 데이터 시작일부터 종료일까지의 실제 원/달러 환율(KRW=X) 데이터 불러오기
+        start_date = full_df['timestamp'].min().strftime('%Y-%m-%d')
+        fx_df = yf.download('KRW=X', start=start_date, progress=False)
+        
+        if not fx_df.empty:
+            # 멀티인덱스 방지 및 날짜 포맷 맞추기
+            fx_close = fx_df['Close'].squeeze().reset_index()
+            fx_close.columns = ['date', 'fx_rate']
+            fx_close['date'] = pd.to_datetime(fx_close['date']).dt.tz_localize(None).dt.floor('D')
+            
+            # 원본 데이터의 날짜(연-월-일) 추출하여 환율과 병합
+            full_df['date'] = full_df['timestamp'].dt.tz_localize(None).dt.floor('D')
+            full_df = pd.merge(full_df, fx_close, on='date', how='left')
+            
+            # 주말/공휴일 등 환율 데이터가 비어있는 날은 직전 평일 환율로 채우기 (ffill/bfill)
+            full_df['fx_rate'] = full_df['fx_rate'].ffill().bfill().fillna(1400.0)
+            
+            # 원화 데이터(BTC > 1,000,000, ETH > 50,000)만 그날의 실제 환율(fx_rate)로 나누기
+            if 'BTC' in full_df.columns:
+                full_df['BTC'] = full_df.apply(
+                    lambda row: round(row['BTC'] / row['fx_rate'], 2) if pd.notnull(row['BTC']) and row['BTC'] > 1000000 else row['BTC'], axis=1
+                )
+            if 'ETH' in full_df.columns:
+                full_df['ETH'] = full_df.apply(
+                    lambda row: round(row['ETH'] / row['fx_rate'], 2) if pd.notnull(row['ETH']) and row['ETH'] > 50000 else row['ETH'], axis=1
                 )
                 
-                # 수정 전: df = pd.read_sql('SELECT * FROM "quant_db"."raw_data" LIMIT 1000', conn)
-                # 수정 후 (아래 코드로 변경)
-                df = pd.read_sql('SELECT * FROM "quant_db"."raw_data"', conn)
-                df.columns = df.columns.str.lower() # 컬럼명 소문자 통일
+            # 계산에 사용한 임시 날짜 컬럼만 지우고 적용된 환율(FX_RATE)은 표에서 확인할 수 있게 남겨두기
+            full_df.rename(columns={'fx_rate': 'USD_KRW(적용환율)'}, inplace=True)
+            full_df.drop(columns=['date'], inplace=True)
+            
+    return full_df
 
-                df = df.rename(columns={'^gspc': 'spx', 'btc-usd': 'btc'})
-                st.success("데이터 로딩 완료!")
-                st.dataframe(df)
-                
-                st.markdown("### 📊 자산 가격 트렌드 및 퀀트 지표")
-                
-                if 'timestamp' in df.columns and 'spx' in df.columns and 'btc' in df.columns:
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
-                    df = df.sort_values('timestamp')
-                    
-                    # 퀀트 지표 계산 (SPX 기준)
-                    df['MA200'] = df['spx'].rolling(window=200).mean() # 200일 이평선
-                    df['MA20'] = df['spx'].rolling(window=20).mean()   # 20일 이평선(볼린저 중심)
-                    df['STD20'] = df['spx'].rolling(window=20).std()   # 20일 표준편차
-                    df['Upper_BB'] = df['MA20'] + (df['STD20'] * 2)    # 볼린저 밴드 상단
-                    df['Lower_BB'] = df['MA20'] - (df['STD20'] * 2)    # 볼린저 밴드 하단
+# 5. 화면에 데이터 및 차트 뿌려주기
+with st.spinner("AWS S3 데이터와 일자별 실제 환율 데이터를 매칭하는 중입니다..."):
+    df = load_all_data()
 
-                    # 매수 시그널 로직: SPX 가격이 볼린저 밴드 하단보다 낮을 때
-                    df['Buy_Signal'] = df.apply(lambda row: row['spx'] if row['spx'] < row['Lower_BB'] else None, axis=1)
-                    
-                    # 이중 Y축 서브플롯 생성
-                    fig = make_subplots(specs=[[{"secondary_y": True}]])
-                    
-                    # 1. 왼쪽 Y축 (SPX 및 지표)
-                    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['spx'], mode='lines', name='SPX', line=dict(color='#1f77b4')), secondary_y=False)
-                    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MA200'], mode='lines', name='SPX 200일 이평선', line=dict(color='#ff7f0e', dash='dash')), secondary_y=False)
-                    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['Upper_BB'], mode='lines', name='SPX BB 상단', line=dict(color='gray', dash='dot')), secondary_y=False)
-                    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['Lower_BB'], mode='lines', name='SPX BB 하단', line=dict(color='gray', dash='dot')), secondary_y=False)
-
-                    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['Buy_Signal'], mode='markers', name='매수 시그널', marker=dict(symbol='triangle-up', size=10, color='red')), secondary_y=False)
-                    
-                    # 2. 오른쪽 Y축 (BTC)
-                    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['btc'], mode='lines', name='BTC (비트코인)', line=dict(color='#2ca02c')), secondary_y=True)
-                    
-                    fig.update_layout(title="SPX (볼린저 밴드) 및 BTC 가격 이중축 추이", template="plotly_white", hovermode="x unified")
-                    fig.update_yaxes(title_text="SPX 가격", secondary_y=False)
-                    fig.update_yaxes(title_text="BTC 가격", showgrid=False, secondary_y=True)
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-                    # 백테스트 기본 지표 계산 (SPX 기준)
-                    df['Return'] = df['spx'].pct_change()
-                    df['Cumulative_Return'] = (1 + df['Return']).cumprod() - 1
-                    
-                    rolling_max = (1 + df['Return']).cumprod().rolling(window=252, min_periods=1).max()
-                    df['Drawdown'] = (1 + df['Return']).cumprod() / rolling_max - 1
-                    mdd = df['Drawdown'].min() * 100
-                    
-                    total_return = df['Cumulative_Return'].iloc[-1] * 100
-                    signal_count = df['Buy_Signal'].count()
+if df is not None:
+    st.success("일자별 실제 환율 매칭 및 달러($) 변환 완료!")
     
-                    # 대시보드 위젯 출력
-                    st.markdown("### 📊 백테스트 성과 요약")
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("단순 보유 누적 수익률", f"{total_return:.2f}%")
-                    col2.metric("최대 낙폭 (MDD)", f"{mdd:.2f}%")
-                    col3.metric("볼린저 밴드 이탈(매수) 횟수", f"{signal_count}회")
-                else:
-                    st.warning("데이터베이스에 'timestamp', 'spx', 'btc' 컬럼이 모두 존재해야 합니다.")
-                    
-            except Exception as e:
-                st.error(f"에러 발생: {e}")
-    else:
-        st.warning("왼쪽 사이드바에 AWS 키를 입력해주세요.")
+    st.subheader("수집 데이터 내역 (일자별 실제 환율 반영 USD)")
+    st.dataframe(df, use_container_width=True)
+    
+    st.subheader("시장 주요 지수 트렌드 (시작점=100 기준 5개 종목 겹쳐보기)")
+    target_cols = ['SPX', 'QQQ', 'VIX', 'BTC', 'ETH']
+    available_cols = [col for col in target_cols if col in df.columns]
+    
+    if 'timestamp' in df.columns:
+        chart_df = df.set_index('timestamp')[available_cols].dropna(how='all')
+        normalized_df = chart_df.apply(lambda x: (x / x.dropna().iloc[0]) * 100 if len(x.dropna()) > 0 else x)
+        st.line_chart(normalized_df)
+else:
+    st.warning("아직 S3 버킷에 저장된 데이터가 없습니다.")
