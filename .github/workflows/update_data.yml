@@ -1,10 +1,10 @@
 name: Daily Quant Data Update
 
 on:
+  workflow_dispatch: # 기존의 수동 실행 버튼
   schedule:
-    - cron: '0 0 * * *' # 매일 UTC 자정 (한국 시간 오전 9시) 자동 실행
-  workflow_dispatch: # 깃허브 웹사이트에서 수동으로 버튼을 눌러 실행할 수 있는 옵션
-
+    # 매일 한국 시간 아침 9시 (UTC 기준 0시 0분)에 자동 실행
+    - cron: '0 0 * * *'
 jobs:
   update-data:
     runs-on: ubuntu-latest
